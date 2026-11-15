@@ -1,85 +1,190 @@
-from fastapi import FastAPI, HTTPException, Query, status
-from pydantic import BaseModel, Field
+from contextlib import asynccontextmanager
 from typing import List, Optional
-from uuid import uuid4
+
+from fastapi import Depends, FastAPI, HTTPException, Query, status
+from fastapi.security import OAuth2PasswordRequestForm
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from database import get_db, init_db
+from models import Book, User
+from schemas import (
+    BookCreate,
+    BookRead,
+    BookUpdate,
+    Token,
+    UserCreate,
+    UserRead,
+)
+from security import (
+    authenticate_user,
+    create_access_token,
+    get_current_user,
+    get_password_hash,
+)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await init_db()
+    yield
+
 
 app = FastAPI(
     title="Book CRUD API",
-    description="Datheon Python + FastAPI Backend Development Internship - Task 1",
-    version="1.0.0",
+    description="Datheon Python + FastAPI Backend Development - Async SQLAlchemy + JWT",
+    version="3.0.0",
+    lifespan=lifespan,
 )
 
-class BookBase(BaseModel):
-    title: str = Field(..., min_length=1, max_length=200)
-    author: str = Field(..., min_length=1, max_length=100)
-    year: Optional[int] = Field(None, ge=0, le=2100)
-    genre: Optional[str] = Field(None, max_length=50)
-
-class BookCreate(BookBase):
-    pass
-
-class BookUpdate(BaseModel):
-    title: Optional[str] = Field(None, min_length=1, max_length=200)
-    author: Optional[str] = Field(None, min_length=1, max_length=100)
-    year: Optional[int] = Field(None, ge=0, le=2100)
-    genre: Optional[str] = Field(None, max_length=50)
-
-class Book(BookBase):
-    id: str
-
-# In-memory database
-books_db = {}
 
 @app.get("/", tags=["Root"])
-def root():
+async def root():
     return {"message": "Book CRUD API", "docs": "/docs"}
 
-@app.get("/books", response_model=List[Book], tags=["Books"])
-def get_books(
+
+@app.post(
+    "/register",
+    response_model=UserRead,
+    status_code=status.HTTP_201_CREATED,
+    tags=["Auth"],
+)
+async def register(user: UserCreate, db: AsyncSession = Depends(get_db)):
+    existing = await db.scalar(select(User).where(User.username == user.username))
+    if existing:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Username already registered",
+        )
+
+    db_user = User(
+        username=user.username,
+        hashed_password=get_password_hash(user.password),
+    )
+    db.add(db_user)
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Username already registered",
+        )
+
+    await db.refresh(db_user)
+    return db_user
+
+
+@app.post("/login", response_model=Token, tags=["Auth"])
+async def login(
+    form_data: OAuth2PasswordRequestForm = Depends(),
+    db: AsyncSession = Depends(get_db),
+):
+    user = await authenticate_user(db, form_data.username, form_data.password)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    access_token = create_access_token(data={"sub": user.username})
+    return {"access_token": access_token, "token_type": "bearer"}
+
+
+@app.get("/me", response_model=UserRead, tags=["Auth"])
+async def read_me(current_user: User = Depends(get_current_user)):
+    return current_user
+
+
+@app.get("/books", response_model=List[BookRead], tags=["Books"])
+async def get_books(
     title: Optional[str] = Query(None, description="Filter by title (case-insensitive contains)"),
     author: Optional[str] = Query(None, description="Filter by author (case-insensitive contains)"),
     genre: Optional[str] = Query(None, description="Filter by genre (case-insensitive contains)"),
     year: Optional[int] = Query(None, description="Filter by exact year"),
+    db: AsyncSession = Depends(get_db),
 ):
-    results = list(books_db.values())
+    stmt = select(Book)
     if title:
-        results = [b for b in results if title.lower() in b["title"].lower()]
+        stmt = stmt.where(Book.title.ilike(f"%{title}%"))
     if author:
-        results = [b for b in results if author.lower() in b["author"].lower()]
+        stmt = stmt.where(Book.author.ilike(f"%{author}%"))
     if genre:
-        results = [b for b in results if b.get("genre") and genre.lower() in b["genre"].lower()]
+        stmt = stmt.where(Book.genre.ilike(f"%{genre}%"))
     if year is not None:
-        results = [b for b in results if b.get("year") == year]
-    return results
+        stmt = stmt.where(Book.year == year)
 
-@app.get("/books/{book_id}", response_model=Book, tags=["Books"])
-def get_book(book_id: str):
-    book = books_db.get(book_id)
+    result = await db.execute(stmt)
+    return list(result.scalars().all())
+
+
+@app.get("/books/{book_id}", response_model=BookRead, tags=["Books"])
+async def get_book(book_id: str, db: AsyncSession = Depends(get_db)):
+    book = await db.get(Book, book_id)
     if not book:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Book not found")
     return book
 
-@app.post("/books", response_model=Book, status_code=status.HTTP_201_CREATED, tags=["Books"])
-def create_book(book: BookCreate):
-    book_id = str(uuid4())
-    book_dict = book.model_dump()
-    book_dict["id"] = book_id
-    books_db[book_id] = book_dict
-    return book_dict
 
-@app.put("/books/{book_id}", response_model=Book, tags=["Books"])
-def update_book(book_id: str, book_update: BookUpdate):
-    book = books_db.get(book_id)
+@app.post(
+    "/books",
+    response_model=BookRead,
+    status_code=status.HTTP_201_CREATED,
+    tags=["Books"],
+)
+async def create_book(
+    book: BookCreate,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    db_book = Book(**book.model_dump(), owner_id=current_user.id)
+    db.add(db_book)
+    await db.commit()
+    await db.refresh(db_book)
+    return db_book
+
+
+@app.put("/books/{book_id}", response_model=BookRead, tags=["Books"])
+async def update_book(
+    book_id: str,
+    book_update: BookUpdate,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    book = await db.get(Book, book_id)
     if not book:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Book not found")
-    update_data = book_update.model_dump(exclude_unset=True)
-    updated_book = {**book, **update_data}
-    books_db[book_id] = updated_book
-    return updated_book
+    if book.owner_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You do not have permission to modify this book",
+        )
+
+    for field, value in book_update.model_dump(exclude_unset=True).items():
+        setattr(book, field, value)
+
+    await db.commit()
+    await db.refresh(book)
+    return book
+
 
 @app.delete("/books/{book_id}", status_code=status.HTTP_204_NO_CONTENT, tags=["Books"])
-def delete_book(book_id: str):
-    if book_id not in books_db:
+async def delete_book(
+    book_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    book = await db.get(Book, book_id)
+    if not book:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Book not found")
-    del books_db[book_id]
+    if book.owner_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You do not have permission to modify this book",
+        )
+
+    await db.delete(book)
+    await db.commit()
     return None
